@@ -16,6 +16,13 @@ Without a running node the application works exactly as before: `start`
 fails only for an invalid id or log path, and the connection is made, and made
 again, in the background.
 
+## Android
+
+On a phone where the Cursio app runs, the same code reaches its node on the
+abstract socket `@cursio-apps` — no Java or Kotlin on your side. The first
+connection asks the phone's person to let your app talk to Cursio under the
+id it registered; until then `start` keeps retrying in the background.
+
 ## Actions
 
 A running process can let another machine of the mesh — a person, or an AI
@@ -44,6 +51,12 @@ cursio apps call Laptop my-app open '{"path": "notes.txt"}'
 Handlers run off the connection's thread; a panic answers that it happened
 and later calls go on. The machine's person allows calls to an application
 once, with a button.
+
+Names of actions, topics and the process are lowercase letters, digits and
+`-` (`game-log`, not `game_log`). A debug build panics at a bad one where it
+is written; a release build leaves that one out, registers everything else,
+and lists what it skipped in `Cursio::rejected()` — one mistyped name never
+takes the whole application out of the mesh.
 
 ## Messages between copies
 

@@ -632,6 +632,34 @@ pub enum ClientMsg {
     /// message is only answered [`NodeMsg::Unsupported`]. Replaces what the
     /// hello declared.
     Devtools { devtools: Devtools },
+    /// Mount a revision of this application's files as one folder: the
+    /// entries in the JSON file `manifest` (a list of [`BlobEntry`], kept in a
+    /// file because a modpack's list outgrows a line), their bytes from the
+    /// store directory `store` — filled from other machines as they are read —
+    /// and every write into `upper`, with `state` keeping what was removed.
+    /// Answered by [`NodeMsg::RevisionMounted`] with the same `id`, which
+    /// names the mount after; it lasts until [`ClientMsg::Unmount`] or until
+    /// this process goes.
+    MountRevision {
+        id: u64,
+        label: String,
+        manifest: PathBuf,
+        store: PathBuf,
+        upper: PathBuf,
+        state: PathBuf,
+    },
+    /// What mount `mount`'s writes changed against its revision; answered by
+    /// [`NodeMsg::RevisionChanges`] with the same `id`.
+    RevisionChanges { id: u64, mount: u64 },
+    /// Take mount `mount` away.
+    Unmount { mount: u64 },
+    /// This process is (`on`) or is no longer doing what the person in front
+    /// of the machine is waiting on — a game running. Meanwhile the node gives
+    /// way: the application's files go to other machines at a reduced rate,
+    /// its own background fetches slow down, and the node does not restart
+    /// itself to update. Reads a revision mount needs are never slowed.
+    /// Cleared when the process goes.
+    Foreground { on: bool },
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -735,6 +763,25 @@ pub enum NodeMsg {
         fetched: Vec<BlobHash>,
         not_found: Vec<BlobHash>,
         failed: Vec<BlobFailure>,
+    },
+    /// [`ClientMsg::MountRevision`] `id`: where the revision can be opened,
+    /// or why it is not mounted.
+    RevisionMounted {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// [`ClientMsg::RevisionChanges`] `id`: files written or created, by path
+    /// under the mount's `upper` directory, and revision paths removed (each
+    /// with all under it) — or why there is no answer.
+    RevisionChanges {
+        id: u64,
+        written: Vec<String>,
+        removed: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 

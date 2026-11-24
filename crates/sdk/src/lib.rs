@@ -441,6 +441,8 @@ impl App {
         let link = shared.clone();
         let logs = Arc::new(LogShared::default());
         let queued = logs.clone();
+        let foreground = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = foreground.clone();
         std::thread::Builder::new()
             .name("cursio-sdk".into())
             .spawn(move || {
@@ -453,12 +455,14 @@ impl App {
                     hooks,
                     queued,
                     abstract_target,
+                    said,
                 ))
             })
             .map_err(|e| Error::Thread(e.to_string()))?;
         Ok(Cursio {
             shared,
             health,
+            foreground,
             requests,
             rejected,
             logs,
@@ -696,6 +700,8 @@ fn skipped(kind: RejectedKind, name: &str, reason: &str) -> Rejected {
 pub struct Cursio {
     shared: Arc<Mutex<Link>>,
     health: watch::Sender<(HealthState, Option<String>)>,
+    /// What [`Cursio::set_foreground`] last said, told again on reconnect.
+    foreground: Arc<std::sync::atomic::AtomicBool>,
     requests: mpsc::UnboundedSender<Request>,
     rejected: Vec<Rejected>,
     logs: Arc<LogShared>,
@@ -791,6 +797,26 @@ impl Cursio {
                 .collect::<String>()
         });
         self.health.send_replace((state, detail));
+        self.connected()
+    }
+
+    /// Say that this process is (`true`) or is no longer (`false`) doing what
+    /// the person at this machine waits on — a game running. While it is, the
+    /// node gives way to it: this application's files go to other machines
+    /// at a reduced rate, its background fetches slow down, and the node does
+    /// not restart to update. Reads through a revision mount are never slowed.
+    ///
+    /// Kept and said again whenever the node reconnects;
+    /// [`Error::NotRunning`] says it is only kept for now.
+    pub fn set_foreground(&self, on: bool) -> Result<(), Error> {
+        self.foreground
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+        let (reply, _) = std::sync::mpsc::channel();
+        let _ = self.requests.send(Request {
+            msg: ClientMsg::Foreground { on },
+            id: 0,
+            reply,
+        });
         self.connected()
     }
 
@@ -956,6 +982,116 @@ impl Cursio {
             }
         }
     }
+
+    /// Mount a revision of this application's files as one folder
+    /// (`docs/revision-mount-design.md`): `entries` read through it, their
+    /// bytes from the `store` directory — fetched from the application's
+    /// copies on other machines the first time each is read, and kept there —
+    /// and every write landing in `upper`, never in the store. `state` keeps
+    /// what was removed, across mounts. All four are absolute paths on this
+    /// machine; the manifest is written into `state`.
+    ///
+    /// For playing before every file is here. Once [`Cursio::fetch`] has
+    /// brought them all, an ordinary folder is faster than any mount.
+    ///
+    /// The mount lasts until the returned handle is dropped, or this process
+    /// ends. Blocks while the node mounts it.
+    pub fn mount_revision(
+        &self,
+        label: &str,
+        entries: &[BlobEntry],
+        store: &Path,
+        upper: &Path,
+        state: &Path,
+    ) -> Result<RevisionMount, Error> {
+        std::fs::create_dir_all(state)
+            .map_err(|e| Error::Send(format!("{}: {e}", state.display())))?;
+        let manifest = state.join("manifest.json");
+        let bytes = serde_json::to_vec(entries).map_err(|e| Error::Send(e.to_string()))?;
+        std::fs::write(&manifest, bytes)
+            .map_err(|e| Error::Send(format!("{}: {e}", manifest.display())))?;
+        let id = next_id();
+        let msg = ClientMsg::MountRevision {
+            id,
+            label: label.to_owned(),
+            manifest,
+            store: store.to_path_buf(),
+            upper: upper.to_path_buf(),
+            state: state.to_path_buf(),
+        };
+        match self.ask(id, msg, MOUNT_WAIT)? {
+            NodeMsg::RevisionMounted {
+                path: Some(path), ..
+            } => Ok(RevisionMount {
+                id,
+                path,
+                requests: self.requests.clone(),
+            }),
+            NodeMsg::RevisionMounted { error, .. } => Err(Error::Send(
+                error.unwrap_or_else(|| "the node did not mount it".into()),
+            )),
+            other => Err(Error::Send(format!("the node answered {other:?}"))),
+        }
+    }
+
+    /// What `mount`'s writes changed against its revision: the files to
+    /// publish (under `upper`) and the revision's paths removed.
+    pub fn revision_changes(&self, mount: &RevisionMount) -> Result<RevisionChanges, Error> {
+        let id = next_id();
+        let msg = ClientMsg::RevisionChanges {
+            id,
+            mount: mount.id,
+        };
+        match self.ask(id, msg, PEERS_WAIT)? {
+            NodeMsg::RevisionChanges {
+                written,
+                removed,
+                error: None,
+                ..
+            } => Ok(RevisionChanges { written, removed }),
+            NodeMsg::RevisionChanges { error: Some(e), .. } => Err(Error::Send(e)),
+            other => Err(Error::Send(format!("the node answered {other:?}"))),
+        }
+    }
+}
+
+/// How long a mount may take: on Windows the drive helper starts first.
+const MOUNT_WAIT: Duration = Duration::from_secs(30);
+
+/// A revision mounted by [`Cursio::mount_revision`]. Unmounted when dropped.
+pub struct RevisionMount {
+    id: u64,
+    path: PathBuf,
+    requests: mpsc::UnboundedSender<Request>,
+}
+
+impl RevisionMount {
+    /// The folder (a drive's root on Windows) to point the program at.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RevisionMount {
+    fn drop(&mut self) {
+        // No answer comes for it: the reply side is dropped at once, and id 0
+        // is never one a request waits on.
+        let (reply, _) = std::sync::mpsc::channel();
+        let _ = self.requests.send(Request {
+            msg: ClientMsg::Unmount { mount: self.id },
+            id: 0,
+            reply,
+        });
+    }
+}
+
+/// What a revision mount's writes changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevisionChanges {
+    /// Files written or created, by path under the mount's `upper` directory.
+    pub written: Vec<String>,
+    /// The revision's paths removed, each with everything under it.
+    pub removed: Vec<String>,
 }
 
 /// The node's answer, by hash, as the caller's entries.
@@ -1023,6 +1159,7 @@ async fn run(
     hooks: Hooks,
     logs: Arc<LogShared>,
     abstract_target: Option<String>,
+    foreground: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let set = |link: Link| *shared.lock().unwrap_or_else(|p| p.into_inner()) = link;
     let node = Arc::new(NodeUid::default());
@@ -1045,6 +1182,7 @@ async fn run(
                     &mut requests,
                     &hooks,
                     &logs,
+                    &foreground,
                 )
                 .await
             }
@@ -1179,6 +1317,7 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     requests: &mut mpsc::UnboundedReceiver<Request>,
     hooks: &Hooks,
     logs: &LogShared,
+    foreground: &std::sync::atomic::AtomicBool,
 ) -> Ended {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -1204,6 +1343,15 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
     };
     let current = health.borrow_and_update().clone();
     if current != (HealthState::Ok, None) && write.write_all(&send_health(current)).await.is_err() {
+        return Ended::Closed;
+    }
+    // A node that restarted mid-game forgot; it hears it again first thing.
+    if foreground.load(std::sync::atomic::Ordering::SeqCst)
+        && write
+            .write_all(&encode_line(&ClientMsg::Foreground { on: true }))
+            .await
+            .is_err()
+    {
         return Ended::Closed;
     }
     // Lines are read by a task of their own and handed over whole: reading
@@ -1241,7 +1389,10 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
                 if write.write_all(&encode_line(&request.msg)).await.is_err() {
                     return Ended::Closed;
                 }
-                waiting.insert(request.id, request.reply);
+                // Id 0 is a notice no answer comes for (an unmount).
+                if request.id != 0 {
+                    waiting.insert(request.id, request.reply);
+                }
             }
             changed = health.changed() => {
                 if changed.is_err() {
@@ -1270,7 +1421,9 @@ async fn session<S: AsyncRead + AsyncWrite + Send + 'static>(
                     }
                     Ok(answer @ (NodeMsg::Sent { id, .. }
                         | NodeMsg::Peers { id, .. }
-                        | NodeMsg::Fetched { id, .. })) => {
+                        | NodeMsg::Fetched { id, .. }
+                        | NodeMsg::RevisionMounted { id, .. }
+                        | NodeMsg::RevisionChanges { id, .. })) => {
                         if let Some(reply) = waiting.remove(&id) {
                             let _ = reply.send(answer);
                         }

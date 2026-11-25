@@ -152,6 +152,39 @@ impl BlobHash {
     pub fn file_name(&self) -> String {
         format!("{}-{}", self.algo.name(), self.hex)
     }
+
+    /// The hash of the file at `path`, read a mebibyte at a time.
+    pub fn of_file(path: &Path, algo: BlobAlgo) -> std::io::Result<Self> {
+        Self::of_reader(std::fs::File::open(path)?, algo)
+    }
+
+    /// The hash of everything `reader` yields, read a mebibyte at a time.
+    pub fn of_reader(reader: impl std::io::Read, algo: BlobAlgo) -> std::io::Result<Self> {
+        fn digest<D: sha2::Digest>(mut reader: impl std::io::Read) -> std::io::Result<String> {
+            let mut hasher = D::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                hasher.update(&buf[..n]);
+            }
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect())
+        }
+        let hex = match algo {
+            BlobAlgo::Sha1 => digest::<sha1::Sha1>(reader)?,
+            BlobAlgo::Sha256 => digest::<sha2::Sha256>(reader)?,
+            BlobAlgo::Sha512 => digest::<sha2::Sha512>(reader)?,
+        };
+        Self::new(algo, &hex).map_err(|e| std::io::Error::other(e.to_string()))
+    }
 }
 
 impl fmt::Display for BlobHash {
@@ -926,6 +959,22 @@ mod tests {
 
     fn line<T: Serialize>(message: &T) -> String {
         String::from_utf8(encode_line(message)).unwrap()
+    }
+
+    /// Pinned to the published digests of "abc": a blob named by one build
+    /// is looked for by another.
+    #[test]
+    fn a_hash_is_the_standard_digest_of_the_bytes() {
+        let of = |algo| BlobHash::of_reader(&b"abc"[..], algo).unwrap().to_string();
+        assert_eq!(
+            of(BlobAlgo::Sha256),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            of(BlobAlgo::Sha1),
+            "sha1:a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert!(of(BlobAlgo::Sha512).starts_with("sha512:ddaf35a193617aba"));
     }
 
     #[test]
